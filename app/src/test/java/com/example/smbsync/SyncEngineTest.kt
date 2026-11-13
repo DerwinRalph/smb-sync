@@ -527,6 +527,26 @@ class SyncEngineTest {
         assertEquals("Mon Wed at 07:05", SyncPair(schedType = SchedType.DAILY, dailyAt = 425, days = 5).scheduleLabel)
     }
 
+    // ---------------------------------------------------------------- scan details
+
+    @Test
+    fun scanReportsCountsAndLogsSummary() {
+        write(phone, "a/b.txt", "12")
+        write(phone, "c.txt", "3")
+        write(pc, "d.txt", "4")
+        sync()
+        assertTrue(progress.any { it.phase.startsWith("Scanning phone") && it.phase.contains("2 files in 1 folder") })
+        assertTrue(progress.any { it.phase.startsWith("Scanning PC") && it.phase.contains("1 file in 0 folders") })
+        // Folder-by-folder updates are throttled to 4 a second, so a scan this quick only shows its start.
+        assertTrue(progress.any { it.phase.startsWith("Scanning phone") && it.detail == "(top folder)" })
+        assertTrue(progress.any { it.phase.startsWith("Comparing 2 phone files with 1 PC file") })
+        assertTrue(logs.toString(), logs.any { it.startsWith("SCAN Checked 2 phone files and 1 PC file in") })
+        // A run with nothing to do still logs what it checked.
+        logs.clear()
+        sync()
+        assertEquals(1, logs.count { it.startsWith("SCAN Checked 3 phone files and 3 PC files") })
+    }
+
     // ---------------------------------------------------------------- stats and log
 
     @Test

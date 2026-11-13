@@ -152,7 +152,8 @@ private const val LAN_PERMISSION = "android.permission.ACCESS_LOCAL_NETWORK"
 private sealed interface Screen {
     data object Home : Screen
     data class Edit(val id: String?) : Screen
-    data class Log(val id: String) : Screen
+    /** id == null shows the combined log of every pair. */
+    data class Log(val id: String?) : Screen
 }
 
 @Composable
@@ -169,13 +170,14 @@ private fun App(hasStorage: Boolean, grantStorage: () -> Unit, hasLan: Boolean, 
 // ---------------------------------------------------------------- Home
 
 @Composable
-private fun HomeScreen(hasStorage: Boolean, grantStorage: () -> Unit, hasLan: Boolean, grantLan: () -> Unit, onEdit: (String?) -> Unit, onLog: (String) -> Unit) {
+private fun HomeScreen(hasStorage: Boolean, grantStorage: () -> Unit, hasLan: Boolean, grantLan: () -> Unit, onEdit: (String?) -> Unit, onLog: (String?) -> Unit) {
     val ctx = LocalContext.current
     val pairs by PairStore.pairs.collectAsState()
     val running by SyncStatus.running.collectAsState()
     Scaffold(
         topBar = {
             TopAppBar(title = { Text("SMB Sync") }, actions = {
+                if (pairs.isNotEmpty()) TextButton(onClick = { onLog(null) }) { Text("All logs") }
                 if (pairs.size > 1) TextButton(onClick = { pairs.forEach { Scheduler.syncNow(ctx, it.id) } }) { Text("Sync all") }
             })
         },
@@ -273,6 +275,12 @@ private fun TransferStats(pr: Progress) {
         LinearProgressIndicator(Modifier.fillMaxWidth())
         Spacer(Modifier.height(4.dp))
         Text(pr.phase, style = small)
+        if (pr.detail.isNotEmpty()) {
+            Text(
+                "Reading  " + pr.detail.replace("/", " › "), style = small, color = dim,
+                maxLines = 1, overflow = TextOverflow.MiddleEllipsis,
+            )
+        }
         return
     }
     val pct = (pr.fraction * 100).toInt()
@@ -892,29 +900,27 @@ private fun HostPicker(onPick: (String) -> Unit, onDismiss: () -> Unit) {
 
 // ---------------------------------------------------------------- Log
 
-private class LogRun(val start: LogEntry?, val end: LogEntry?, val rows: List<LogEntry>) {
+private class LogRun(
+    val start: LogEntry?, val end: LogEntry?, val rows: List<LogEntry>,
+    val pairId: String, val pairName: String,
+) {
     val id: Long get() = (start ?: rows.firstOrNull() ?: end)?.time ?: 0
     val time: Long get() = id
+    val key: String get() = "$pairId-$id"
     val failed: Boolean get() = end?.type == LogType.FAILED
     fun count(vararg t: LogType) = rows.count { it.type in t }
     val bytes: Long get() = rows.filter { it.type == LogType.UP || it.type == LogType.DOWN || it.type == LogType.CONFLICT }.sumOf { it.size }
     /** A finished run in which nothing was copied, deleted or went wrong. */
-    val quiet: Boolean get() = end != null && !failed && rows.none { it.type != LogType.INFO }
+    val quiet: Boolean get() = end != null && !failed && rows.none { it.type != LogType.INFO && it.type != LogType.SCAN }
 }
 
-private sealed interface LogItem {
-    class One(val run: LogRun) : LogItem
-    /** Several back-to-back checks that found nothing to do, folded into one line. */
-    class Quiet(val runs: List<LogRun>) : LogItem
-}
-
-/** Splits the flat log into sync runs, newest first, folding consecutive no-change runs together. */
-private fun groupRuns(entries: List<LogEntry>): List<LogItem> {
+/** Splits one pair's flat log into sync runs, oldest first. */
+private fun groupRuns(entries: List<LogEntry>, pairId: String, pairName: String): List<LogRun> {
     val runs = ArrayList<LogRun>()
     var start: LogEntry? = null
     var rows = ArrayList<LogEntry>()
     fun close(end: LogEntry?) {
-        if (start != null || rows.isNotEmpty() || end != null) runs += LogRun(start, end, rows)
+        if (start != null || rows.isNotEmpty() || end != null) runs += LogRun(start, end, rows, pairId, pairName)
         start = null
         rows = ArrayList()
     }
@@ -924,16 +930,7 @@ private fun groupRuns(entries: List<LogEntry>): List<LogItem> {
         else -> rows += e
     }
     close(null)
-    val out = ArrayList<LogItem>()
-    var quiet = ArrayList<LogRun>()
-    for (r in runs.asReversed()) {
-        if (r.quiet) quiet += r else {
-            if (quiet.isNotEmpty()) { out += LogItem.Quiet(quiet); quiet = ArrayList() }
-            out += LogItem.One(r)
-        }
-    }
-    if (quiet.isNotEmpty()) out += LogItem.Quiet(quiet)
-    return out
+    return runs
 }
 
 private val SUMMARY_SHAPE =
@@ -941,6 +938,7 @@ private val SUMMARY_SHAPE =
 
 private enum class LogFilter(val label: String, val types: Set<LogType>) {
     ALL("All", emptySet()),
+    CHANGES("With changes", emptySet()),
     SENT("Sent", setOf(LogType.UP)),
     RECEIVED("Received", setOf(LogType.DOWN)),
     DELETED("Deleted", setOf(LogType.DEL_PHONE, LogType.DEL_PC)),
@@ -957,25 +955,38 @@ private fun dayLabel(time: Long): String {
     return "$day, $clock"
 }
 
+/** One pair's log, or with [id] == null every pair's runs merged newest first. */
 @Composable
-private fun LogScreen(id: String, onDone: () -> Unit) {
+private fun LogScreen(id: String?, onDone: () -> Unit) {
     val running by SyncStatus.running.collectAsState()
-    var items by remember { mutableStateOf<List<LogItem>?>(null) }
+    var runs by remember { mutableStateOf<List<LogRun>?>(null) }
     var version by remember { mutableStateOf(0) }
     var filter by remember { mutableStateOf(LogFilter.ALL) }
-    val isRunning = running[id] != null
+    val isRunning = if (id == null) running.isNotEmpty() else running[id] != null
     LaunchedEffect(isRunning, version) {
         do {
-            items = withContext(Dispatchers.IO) { groupRuns(SyncLog(PairStore.logFile(id)).read()) }
+            runs = withContext(Dispatchers.IO) {
+                val ids = if (id == null) PairStore.pairs.value.map { it.id } else listOf(id)
+                ids.flatMap { pid ->
+                    groupRuns(SyncLog(PairStore.logFile(pid)).read(), pid, PairStore.get(pid)?.name ?: "")
+                }.sortedByDescending { it.time }
+            }
             if (isRunning) kotlinx.coroutines.delay(1500)
         } while (isRunning)
     }
     Scaffold(topBar = {
         TopAppBar(
-            title = { Text("Log – ${PairStore.get(id)?.name ?: ""}", maxLines = 1, overflow = TextOverflow.Ellipsis) },
+            title = {
+                Text(
+                    if (id == null) "All logs" else "Log – ${PairStore.get(id)?.name ?: ""}",
+                    maxLines = 1, overflow = TextOverflow.Ellipsis,
+                )
+            },
             navigationIcon = { IconButton(onClick = onDone) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } },
             actions = {
-                TextButton(enabled = !isRunning, onClick = { SyncLog(PairStore.logFile(id)).clear(); version++ }) { Text("Clear") }
+                if (id != null) {
+                    TextButton(enabled = !isRunning, onClick = { SyncLog(PairStore.logFile(id)).clear(); version++ }) { Text("Clear") }
+                }
             },
         )
     }) { pad ->
@@ -988,11 +999,12 @@ private fun LogScreen(id: String, onDone: () -> Unit) {
                     FilterChip(selected = filter == f, onClick = { filter = f }, label = { Text(f.label) })
                 }
             }
-            val shown = (items ?: emptyList()).filter { item ->
-                when {
-                    filter == LogFilter.ALL -> true
-                    item is LogItem.One -> item.run.rows.any { it.type in filter.types } || (filter == LogFilter.PROBLEMS && item.run.failed)
-                    else -> false
+            val shown = (runs ?: emptyList()).filter { run ->
+                when (filter) {
+                    LogFilter.ALL -> true
+                    LogFilter.CHANGES -> !run.quiet
+                    LogFilter.PROBLEMS -> run.failed || run.rows.any { it.type in filter.types }
+                    else -> run.rows.any { it.type in filter.types }
                 }
             }
             LazyColumn(
@@ -1000,33 +1012,18 @@ private fun LogScreen(id: String, onDone: () -> Unit) {
                 contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 24.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
-                if (items != null && shown.isEmpty()) item {
+                if (runs != null && shown.isEmpty()) item {
                     Text(
                         if (filter == LogFilter.ALL) "Nothing logged yet." else "Nothing in this category.",
                         Modifier.padding(12.dp), color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 }
-                itemsIndexed(shown, key = { _, it -> if (it is LogItem.One) it.run.id else -(it as LogItem.Quiet).runs.first().id }) { index, item ->
-                    when (item) {
-                        is LogItem.One -> RunCard(item.run, filter, startExpanded = index == 0)
-                        is LogItem.Quiet -> QuietLine(item.runs)
-                    }
+                itemsIndexed(shown, key = { _, r -> r.key }) { index, run ->
+                    RunCard(run, filter, startExpanded = index == 0, showPair = id == null)
                 }
             }
         }
     }
-}
-
-@Composable
-private fun QuietLine(runs: List<LogRun>) {
-    val newest = runs.first().time
-    val oldest = runs.last().time
-    Text(
-        if (runs.size == 1) "✓  ${dayLabel(newest)} · checked, nothing to sync"
-        else "✓  ${runs.size} checks with nothing to sync · ${dayLabel(oldest)} → ${dayLabel(newest)}",
-        Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 2.dp),
-        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
-    )
 }
 
 /** One coloured count such as "↑ 8 sent"; hidden when the count is zero. */
@@ -1039,16 +1036,23 @@ private fun CountPill(symbol: String, n: Int, word: String, color: androidx.comp
 }
 
 @Composable
-private fun RunCard(run: LogRun, filter: LogFilter, startExpanded: Boolean) {
+private fun RunCard(run: LogRun, filter: LogFilter, startExpanded: Boolean, showPair: Boolean) {
     val cs = MaterialTheme.colorScheme
-    var expanded by remember { mutableStateOf(startExpanded || filter != LogFilter.ALL) }
+    var expanded by remember { mutableStateOf(startExpanded || (filter != LogFilter.ALL && filter != LogFilter.CHANGES)) }
     val problems = run.rows.filter { it.type == LogType.ERROR || (it.type == LogType.CONFLICT && it.size == 0L) }
     // Files are what people look for; "folder created" rows and the plan line are bookkeeping.
     val files = run.rows.filter {
         it.type in setOf(LogType.UP, LogType.DOWN, LogType.DEL_PHONE, LogType.DEL_PC) || (it.type == LogType.CONFLICT && it.size > 0)
-    }.filter { filter == LogFilter.ALL || it.type in filter.types }
+    }.filter { filter.types.isEmpty() || it.type in filter.types }
     Card(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(14.dp)) {
+            if (showPair) {
+                Text(
+                    run.pairName.ifBlank { "Unnamed pair" }, style = MaterialTheme.typography.labelLarge,
+                    color = cs.primary, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                )
+                Spacer(Modifier.height(2.dp))
+            }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(dayLabel(run.time), style = MaterialTheme.typography.titleMedium)
                 Spacer(Modifier.weight(1f))
@@ -1064,8 +1068,17 @@ private fun RunCard(run: LogRun, filter: LogFilter, startExpanded: Boolean) {
                 CountPill("✕", run.count(LogType.DEL_PHONE, LogType.DEL_PC), "deleted", cs.error)
                 CountPill("≠", run.count(LogType.CONFLICT), "conflict", cs.error)
                 CountPill("!", run.count(LogType.ERROR), "failed", cs.error)
+                if (run.quiet) {
+                    Surface(color = cs.onSurfaceVariant.copy(alpha = 0.12f), shape = MaterialTheme.shapes.small) {
+                        Text(
+                            "✓ Nothing to sync", Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                            color = cs.onSurfaceVariant, style = MaterialTheme.typography.labelLarge,
+                        )
+                    }
+                }
             }
             val sub = ArrayList<String>()
+            run.rows.lastOrNull { it.type == LogType.SCAN }?.let { sub += it.text }
             if (run.bytes > 0) sub += fmtBytes(run.bytes)
             val folders = run.count(LogType.FOLDER)
             if (folders > 0) sub += if (folders == 1) "1 folder created" else "$folders folders created"

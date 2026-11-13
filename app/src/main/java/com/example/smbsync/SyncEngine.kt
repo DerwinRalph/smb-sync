@@ -48,11 +48,14 @@ class SyncState(private val file: File) {
 
 class SyncAbort(msg: String) : Exception(msg)
 
-enum class LogType { START, END, FAILED, UP, DOWN, DEL_PHONE, DEL_PC, FOLDER, CONFLICT, ERROR, INFO }
+/** SCAN: one line per run saying how much was compared. */
+enum class LogType { START, END, FAILED, UP, DOWN, DEL_PHONE, DEL_PC, FOLDER, CONFLICT, ERROR, INFO, SCAN }
 
 /** Live state of a running sync. Byte counts are 0 until the list of changes is known. */
 data class Progress(
     val phase: String,
+    /** Extra line under the phase while scanning: the folder being read. */
+    val detail: String = "",
     val index: Int = 0,
     val count: Int = 0,
     val fileDone: Long = 0,
@@ -93,6 +96,9 @@ class SyncResult {
         return if (cancelled) "Stopped – $s" else s
     }
 }
+
+/** "1 file", "1,234 files". */
+fun plural(n: Int, word: String) = String.format(Locale.US, "%,d %s", n, if (n == 1) word else word + "s")
 
 fun fmtBytes(n: Long): String = when {
     n >= 1L shl 30 -> String.format(Locale.US, "%.2f GB", n / 1073741824.0)
@@ -149,21 +155,34 @@ class SyncEngine(
                 throw SyncAbort("Phone folder not found: ${pair.localPath}")
         }
         try {
-            progress(Progress("Connecting…"))
+            progress(Progress("Connecting to ${pair.remoteDisplay}…"))
             smb.connect()
             if (!smb.baseExists()) {
                 if (state.map.isEmpty() && canUp) smb.mkdirs("") else
                     throw SyncAbort("Folder not found on the PC")
             }
 
-            progress(Progress("Scanning phone…"))
+            val scanStart = System.nanoTime()
             val unknown = ArrayList<String>()
             val local = HashMap<String, Meta>()
+            startScan("phone")
             scanLocal(root, "", local, unknown)
-            progress(Progress("Scanning PC…"))
+            scanTick("", force = true)
+            val phoneFiles = scanFiles
             val remote = HashMap<String, Meta>()
+            startScan("PC")
             scanRemote("", remote, unknown)
+            scanTick("", force = true)
+            val pcFiles = scanFiles
             remote.values.filter { it.dir }.forEach { remoteDirs += key(it.path) }
+            progress(Progress("Comparing ${plural(phoneFiles, "phone file")} with ${plural(pcFiles, "PC file")}…"))
+            val ms = (System.nanoTime() - scanStart) / 1_000_000
+            log(
+                LogType.SCAN,
+                "Checked ${plural(phoneFiles, "phone file")} and ${plural(pcFiles, "PC file")} in " +
+                    (if (ms < 1000) "under a second" else "${ms / 1000} s"),
+                0,
+            )
 
             // Never let a side that suddenly looks empty wipe the other one.
             val known = state.map.values.count { !it.dir }
@@ -212,8 +231,39 @@ class SyncEngine(
         return pair.skipHidden && (hidden || name.startsWith("."))
     }
 
+    // ------------------------------------------------------------ scan progress
+
+    private var scanSide = ""
+    private var scanFiles = 0
+    private var scanDirs = 0
+    private var scanBytes = 0L
+    private var lastScanEmit = 0L
+
+    private fun startScan(side: String) {
+        scanSide = side
+        scanFiles = 0
+        scanDirs = 0
+        scanBytes = 0
+        progress(Progress("Scanning $side…", detail = "(top folder)"))
+        lastScanEmit = System.nanoTime() / 1_000_000
+    }
+
+    /** Reports what has been found so far and which folder is being read, at most 4 times a second. */
+    private fun scanTick(rel: String, force: Boolean = false) {
+        val now = System.nanoTime() / 1_000_000
+        if (!force && now - lastScanEmit < 250) return
+        lastScanEmit = now
+        progress(
+            Progress(
+                "Scanning $scanSide · ${plural(scanFiles, "file")} in ${plural(scanDirs, "folder")} (${fmtBytes(scanBytes)})",
+                detail = if (force) "" else if (rel.isEmpty()) "(top folder)" else rel,
+            )
+        )
+    }
+
     private fun scanLocal(dir: File, rel: String, out: HashMap<String, Meta>, unknown: MutableList<String>) {
         if (stopped()) throw SyncAbort("Stopped")
+        scanTick(rel)
         val kids = dir.listFiles()
         if (kids == null) {
             if (rel.isEmpty()) throw SyncAbort("Can't read the phone folder")
@@ -227,15 +277,20 @@ class SyncEngine(
             if (f.isDirectory) {
                 if (!pair.subfolders) continue
                 out[key(r)] = Meta(r, true, 0, 0)
+                scanDirs++
                 scanLocal(f, r, out, unknown)
             } else if (f.isFile) {
-                out[key(r)] = Meta(r, false, f.length(), f.lastModified())
+                val m = Meta(r, false, f.length(), f.lastModified())
+                out[key(r)] = m
+                scanFiles++
+                scanBytes += m.size
             }
         }
     }
 
     private fun scanRemote(rel: String, out: HashMap<String, Meta>, unknown: MutableList<String>) {
         if (stopped()) throw SyncAbort("Stopped")
+        scanTick(rel)
         val kids = try {
             smb.list(rel)
         } catch (e: Exception) {
@@ -249,9 +304,12 @@ class SyncEngine(
             if (m.dir) {
                 if (!pair.subfolders) continue
                 out[key(m.path)] = m
+                scanDirs++
                 scanRemote(m.path, out, unknown)
             } else {
                 out[key(m.path)] = m
+                scanFiles++
+                scanBytes += m.size
             }
         }
     }
@@ -381,7 +439,10 @@ class SyncEngine(
         if (!force && now - lastEmit < 200) return
         lastEmit = now
         progress(
-            Progress(phase, index, actions.size, fileDone, fileSize, minOf(doneBytes + innerBase + fileDone, totalBytes), totalBytes, speed)
+            Progress(
+                phase, index = index, count = actions.size, fileDone = fileDone, fileSize = fileSize,
+                totalDone = minOf(doneBytes + innerBase + fileDone, totalBytes), totalBytes = totalBytes, speed = speed,
+            )
         )
     }
 
